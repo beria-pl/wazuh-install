@@ -13,15 +13,42 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Add Docker's official GPG key:
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# Add the repository to Apt sources:
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+
+# Function to check Docker version
+check_docker_version() {
+    if command_exists docker; then
+        if ! command_exists jq; then
+            echo -e "${YELLOW}jq is not installed. Installing jq...${NC}"
+            sudo apt-get install -y jq
+        fi
+        INSTALLED_VERSION=$(docker --version | awk '{print $3}' | sed 's/,//')
+        LATEST_VERSION=$(curl -sL https://api.github.com/repos/docker/docker-ce/releases/latest | jq -r '.tag_name')
+        echo -e "${GREEN}Your Docker version: ${INSTALLED_VERSION}${NC}"
+        echo -e "${YELLOW}Latest available Docker version: ${LATEST_VERSION}${NC}"
+    else
+        echo -e "${RED}Docker is not installed.${NC}"
+    fi
+}
+
 # Function to install Docker and Docker Compose
 install_docker() {
     echo -e "${YELLOW}Installing Docker and Docker Compose...${NC}"
     sudo apt update && sudo apt upgrade -y
     sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo apt update
-    sudo apt install -y docker-ce docker-ce-cli containerd.io
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     sudo usermod -aG docker $USER
     echo -e "${GREEN}Docker installed successfully.${NC}"
 
@@ -31,74 +58,55 @@ install_docker() {
     echo -e "${GREEN}Docker Compose installed successfully.${NC}"
 }
 
-# Function to get the latest stable Wazuh release
-get_latest_wazuh_release() {
-    echo -e "${YELLOW}Fetching latest stable Wazuh release...${NC}"
-    LATEST_WAZUH_TAG=$(curl -s https://api.github.com/repos/wazuh/wazuh-docker/releases/latest | grep 'tag_name' | cut -d '"' -f 4)
-    echo -e "${GREEN}Latest Wazuh release: ${LATEST_WAZUH_TAG}${NC}"
+# Function to set system parameters for Wazuh
+configure_system() {
+    echo -e "${YELLOW}Configuring system parameters for Wazuh...${NC}"
+    sudo sysctl -w vm.max_map_count=262144
+    echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
+    echo -e "${GREEN}System parameters configured.${NC}"
 }
 
-# Function to deploy Wazuh in a single-node setup
-deploy_wazuh() {
-    echo -e "${YELLOW}Deploying Wazuh (Single Node)...${NC}"
-    mkdir -p ~/wazuh && cd ~/wazuh
-    get_latest_wazuh_release
-    
-    # Create a single-node Docker Compose configuration
-    cat <<EOF > docker-compose.yml
-version: "3.7"
-services:
-  wazuh:
-    image: wazuh/wazuh-manager:${LATEST_WAZUH_TAG}
-    container_name: wazuh-manager
-    restart: always
-    ports:
-      - "1514:1514/udp"
-      - "55000:55000/tcp"
-    volumes:
-      - wazuh-logs:/var/ossec/logs
-      - wazuh-etc:/var/ossec/etc
-      - wazuh-queue:/var/ossec/queue
-      - wazuh-agentless:/var/ossec/agentless
-      - wazuh-integrations:/var/ossec/integrations
-      - wazuh-active-response:/var/ossec/active-response
-volumes:
-  wazuh-logs:
-  wazuh-etc:
-  wazuh-queue:
-  wazuh-agentless:
-  wazuh-integrations:
-  wazuh-active-response:
-EOF
+# Function to check and set Docker memory allocation
+check_docker_memory() {
+    TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
+    if [ "$TOTAL_MEM" -lt 6]; then
+        echo -e "${RED}Warning: Your system has less than 6GB of RAM. Wazuh may not perform optimally.${NC}"
+    else
+        echo -e "${GREEN}Your system has sufficient RAM (${TOTAL_MEM}GB) for Wazuh.${NC}"
+    fi
+}
 
+# Function to get the latest Wazuh Docker image tag
+get_latest_wazuh_version() {
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/wazuh/wazuh-docker/releases/latest | jq -r '.tag_name')
+    echo -e "${GREEN}Latest Wazuh Docker image tag: ${LATEST_VERSION}${NC}"
+}
+
+# Function to clone the Wazuh Docker repository and set up a single-node deployment
+deploy_wazuh() {
+    get_latest_wazuh_version
+    echo -e "${YELLOW}Cloning Wazuh Docker repository...${NC}"
+    git clone https://github.com/wazuh/wazuh-docker.git -b ${LATEST_VERSION}
+    cd wazuh-docker/single-node
+
+    # Update the Docker image tag version
+    sed -i "s/wazuh\/wazuh:[0-9]*\.[0-9]*\.[0-9]*/wazuh\/wazuh:${LATEST_VERSION}/g" docker-compose.yml
+
+    # Generate SSL certificates
+    echo -e "${YELLOW}Generating SSL certificates for Wazuh Indexer...${NC}"
+    docker-compose -f generate-indexer-certs.yml run --rm generator
+    echo -e "${GREEN}Certificates generated and saved in /opt/wazuh/config/wazuh_indexer_ssl_certs.${NC}"
+
+    echo -e "${YELLOW}Deploying Wazuh (Single Node)...${NC}"
     docker-compose up -d
     echo -e "${GREEN}Wazuh single-node deployment completed.${NC}"
 }
 
-# Function to configure PfSense logging
-configure_pfsense() {
-    echo -e "${YELLOW}Configuring PfSense log forwarding...${NC}"
-    echo "Follow these steps to configure PfSense to send logs to Wazuh:" > ~/wazuh/pfsense_setup.txt
-    echo "1. Log into PfSense Web UI." >> ~/wazuh/pfsense_setup.txt
-    echo "2. Navigate to Status > System Logs > Settings." >> ~/wazuh/pfsense_setup.txt
-    echo "3. Enable 'Remote Logging' and set Remote Syslog Server to the Wazuh Manager IP." >> ~/wazuh/pfsense_setup.txt
-    echo "4. Use UDP port 1514 for Syslog (ensure Wazuh container listens on this port)." >> ~/wazuh/pfsense_setup.txt
-    echo "5. Save the settings and restart logging services." >> ~/wazuh/pfsense_setup.txt
-    echo -e "${GREEN}PfSense setup instructions saved to ~/wazuh/pfsense_setup.txt${NC}"
-}
-
-# Function to verify Wazuh is running
-verify_wazuh() {
-    echo -e "${YELLOW}Verifying Wazuh deployment...${NC}"
-    if docker ps | grep -q wazuh-manager; then
-        echo -e "${GREEN}Wazuh is running successfully.${NC}"
-    else
-        echo -e "${RED}Wazuh deployment failed. Check logs using 'docker-compose logs'.${NC}"
-        exit 1
-    fi
-}
-
 # Main execution
+check_docker_version
+check_docker_memory
+configure_system
+
 if ! command_exists docker; then
     install_docker
 else
@@ -112,7 +120,5 @@ else
 fi
 
 deploy_wazuh
-configure_pfsense
-verify_wazuh
 
 echo -e "${GREEN}Wazuh single-node setup completed successfully!${NC}"
